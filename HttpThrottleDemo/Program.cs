@@ -38,21 +38,31 @@ try
         throttler.RunAsync(async ct =>
         {
             Interlocked.Increment(ref inFlight);
+
             UpdateMax(ref maxInFlight, inFlight);
+
             var sw = Stopwatch.StartNew();
             try
             {
                 var url = opts.UrlTemplate.Replace("{i}", i.ToString());
                 using var resp = await http.GetAsync(url, ct);
+                
                 resp.EnsureSuccessStatusCode();
+                
                 Interlocked.Increment(ref ok);
+                
                 var text = await resp.Content.ReadAsStringAsync(ct);
+
                 return (i, elapsed: sw.Elapsed, ok: true, error: (Exception?)null, payloadBytes: text.Length);
             }
             catch (Exception ex)
             {
                 Interlocked.Increment(ref fail);
+
+                Console.WriteLine($"[{i}] Error: {ex.Message}");
+
                 return (i, elapsed: sw.Elapsed, ok: false, error: ex, payloadBytes: 0);
+
             }
             finally
             {

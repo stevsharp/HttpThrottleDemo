@@ -1,5 +1,10 @@
 # HttpThrottleDemo
 
+Read the full article at :
+
+https://dev.to/stevsharp/semaphoreslim-in-net-a-practical-guide-with-the-rest-of-the-toolbox-1mh7
+
+
 A tiny console that shows `SemaphoreSlim` based throttling for async HTTP work. You set a max concurrency, it runs a batch of requests, it reports latency and the highest concurrency observed.
 
 ## Requirements

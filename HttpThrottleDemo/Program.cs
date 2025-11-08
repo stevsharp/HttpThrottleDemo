@@ -1,16 +1,22 @@
 ﻿using System.Diagnostics;
-using System.Net.Http;
+using System.Threading.Channels;
 
 Console.Title = "HttpThrottleDemo";
 
-// Parse simple args
+// Parse args
 var opts = Options.Parse(args);
 
 // Ctrl+C support
 using var cts = new CancellationTokenSource(opts.Timeout);
-Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
+Console.CancelKeyPress += (_, e) => { 
+    e.Cancel = true; cts.Cancel(); 
+};
 
-Console.WriteLine($"Starting with concurrency={opts.Concurrency}, total={opts.Total}, timeout={opts.Timeout}");
+Console.WriteLine($"Mode={(opts.UseChannel ? "Channel" : "Throttler")}, concurrency={opts.Concurrency}, total={opts.Total}, timeout={opts.Timeout}");
+
+if (opts.UseChannel) 
+    Console.WriteLine($"ChannelCapacity={opts.ChannelCapacity}");
+
 Console.WriteLine($"URL template: {opts.UrlTemplate}");
 Console.WriteLine("Press Ctrl+C to cancel.\n");
 
@@ -23,68 +29,100 @@ using var http = new HttpClient(new SocketsHttpHandler
     Timeout = Timeout.InfiniteTimeSpan
 };
 
-var throttler = new HttpThrottler(opts.Concurrency);
-
 int inFlight = 0;
 int maxInFlight = 0;
 int ok = 0;
 int fail = 0;
-
 var swAll = Stopwatch.StartNew();
 
 try
 {
-    var tasks = Enumerable.Range(0, opts.Total).Select(i =>
-        throttler.RunAsync(async ct =>
+    var urls = Enumerable.Range(0, opts.Total)
+                         .Select(i => opts.UrlTemplate.Replace("{i}", i.ToString()))
+                         .ToArray();
+
+    //opts.UseChannel = true;     // force channel mode testing purposes
+    //opts.ChannelCapacity = 8;   // desired capacity
+
+    if (opts.UseChannel)
+    {
+        // Channel mode with backpressure
+        var channel = Channel.CreateBounded<string>(new BoundedChannelOptions(capacity: opts.ChannelCapacity)
         {
-            Interlocked.Increment(ref inFlight);
+            FullMode = BoundedChannelFullMode.Wait
+        });
 
-            UpdateMax(ref maxInFlight, inFlight);
+        var writer = Task.Run(async () =>
+        {
+            foreach (var url in urls) await channel.Writer.WriteAsync(url, cts.Token);
+            channel.Writer.Complete();
+        });
 
-            var sw = Stopwatch.StartNew();
-            try
+        var consumers = Enumerable.Range(0, opts.Concurrency).Select(_ => Task.Run(async () =>
+        {
+            await foreach (var url in channel.Reader.ReadAllAsync(cts.Token))
             {
-                var url = opts.UrlTemplate.Replace("{i}", i.ToString());
-                using var resp = await http.GetAsync(url, ct);
-                
-                resp.EnsureSuccessStatusCode();
-                
-                Interlocked.Increment(ref ok);
-                
-                var text = await resp.Content.ReadAsStringAsync(ct);
-
-                return (i, elapsed: sw.Elapsed, ok: true, error: (Exception?)null, payloadBytes: text.Length);
+                Interlocked.Increment(ref inFlight);
+                UpdateMax(ref maxInFlight, inFlight);
+                var sw = Stopwatch.StartNew();
+                try
+                {
+                    using var resp = await http.GetAsync(url, cts.Token);
+                    resp.EnsureSuccessStatusCode();
+                    Interlocked.Increment(ref ok);
+                }
+                catch
+                {
+                    Interlocked.Increment(ref fail);
+                }
+                finally
+                {
+                    Interlocked.Decrement(ref inFlight);
+                }
             }
-            catch (Exception ex)
+        }));
+
+        await Task.WhenAll(consumers.Append(writer));
+    }
+    else
+    {
+        // Throttler mode
+        using var throttler = new HttpThrottler(opts.Concurrency);
+
+        var tasks = urls.Select(u =>
+            throttler.RunAsync(async ct =>
             {
-                Interlocked.Increment(ref fail);
+                Interlocked.Increment(ref inFlight);
+                UpdateMax(ref maxInFlight, inFlight);
+                var sw = Stopwatch.StartNew();
+                try
+                {
+                    using var resp = await http.GetAsync(u, ct);
+                    resp.EnsureSuccessStatusCode();
+                    Interlocked.Increment(ref ok);
+                }
+                catch
+                {
+                    Interlocked.Increment(ref fail);
+                }
+                finally
+                {
+                    Interlocked.Decrement(ref inFlight);
+                }
 
-                Console.WriteLine($"[{i}] Error: {ex.Message}");
+                return true;
+            }, cts.Token));
 
-                return (i, elapsed: sw.Elapsed, ok: false, error: ex, payloadBytes: 0);
-
-            }
-            finally
-            {
-                Interlocked.Decrement(ref inFlight);
-            }
-        }, cts.Token));
-
-    var results = await Task.WhenAll(tasks);
+        await Task.WhenAll(tasks);
+    }
 
     swAll.Stop();
-
-    // Print a short report
-    var avgMs = results.Average(r => r.elapsed.TotalMilliseconds);
-    var p95Ms = Percentile(results.Select(r => r.elapsed.TotalMilliseconds), 95);
 
     Console.WriteLine();
     Console.WriteLine("Run summary");
     Console.WriteLine($"  Success: {ok}");
     Console.WriteLine($"  Failed : {fail}");
     Console.WriteLine($"  Max concurrent observed: {maxInFlight}");
-    Console.WriteLine($"  Avg latency: {avgMs:F1} ms");
-    Console.WriteLine($"  P95 latency: {p95Ms:F1} ms");
     Console.WriteLine($"  Total time: {swAll.Elapsed}");
 }
 catch (OperationCanceledException)
@@ -93,12 +131,8 @@ catch (OperationCanceledException)
     Console.WriteLine("\nCanceled by user or timeout.");
     Console.WriteLine($"Partial progress. Success={ok}, Failed={fail}, Max concurrent observed={maxInFlight}");
 }
-finally
-{
-    throttler.Dispose();
-}
 
-Console.ReadLine();
+// helpers
 
 static void UpdateMax(ref int target, int value)
 {
@@ -107,17 +141,3 @@ static void UpdateMax(ref int target, int value)
         Interlocked.CompareExchange(ref target, value, snapshot);
 }
 
-static double Percentile(IEnumerable<double> values, double percentile)
-{
-    var arr = values.OrderBy(v => v).ToArray();
-    if (arr.Length == 0) 
-        return 0;
-    var rank = (percentile / 100.0) * (arr.Length - 1);
-    var low = (int)Math.Floor(rank);
-    var high = (int)Math.Ceiling(rank);
-    if (low == high) 
-        return arr[low];
-    var weight = rank - low;
-
-    return arr[low] * (1 - weight) + arr[high] * weight;
-}

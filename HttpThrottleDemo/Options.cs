@@ -4,6 +4,9 @@
 // -----------------------------------------------------------------------------
 public sealed record Options(int Concurrency, int Total, TimeSpan Timeout, string UrlTemplate)
 {
+    public bool UseChannel { get; internal set; }
+    public int ChannelCapacity { get; internal set; }
+
     public static Options Parse(string[] args)
     {
         // Defaults: 8 concurrent, 100 requests, 30 seconds, httpbin delay endpoint

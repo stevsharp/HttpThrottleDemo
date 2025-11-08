@@ -57,3 +57,7 @@ dotnet run -- -c 4 -n 50 -u "https://example.com/items/{i}"
 * `Program.cs` with `HttpThrottler` and minimal options parsing
 
 That is it. Tune `-c` for your API and network, keep an eye on the summary to verify the limit behaves as expected.
+
+## Connect with Me
+
+[![LinkedIn](https://img.shields.io/badge/LinkedIn-Profile-blue)](https://www.linkedin.com/in/spyros-ponaris-913a6937/)
